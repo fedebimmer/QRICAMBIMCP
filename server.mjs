@@ -3,7 +3,16 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --- helpers ---
+// --- CORS globale + preflight ---
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// --- helper ---
 const sendSSE = (res, id, payload) =>
   res.write(`event: message\nid: ${id}\ndata: ${JSON.stringify(payload)}\n\n`);
 
@@ -17,10 +26,16 @@ const openSSE = (res) => {
   res.status(200);
   res.set({
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*"
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization"
   });
+  // Heartbeat per evitare timeout (15s)
+  const hb = setInterval(() => res.write(`: ping\n\n`), 15000);
+  res.on("close", () => clearInterval(hb));
 };
 
 const sendTools = (res) => {
@@ -67,19 +82,21 @@ const sendTools = (res) => {
 // --- health check ---
 app.get("/", (_req, res) => res.send("Qricambi MCP up"));
 
-// --- SSE handshake (GET) ---
+// --- preflight explicito per /sse ---
+app.options("/sse", (_req, res) => res.sendStatus(204));
+
+// --- handshake GET /sse ---
 app.get("/sse", (req, res) => {
   openSSE(res);
   sendTools(res);
 });
 
-// --- SSE + invocazioni (POST) ---
+// --- POST /sse: flusso + invocazioni tools ---
 app.post("/sse", (req, res) => {
   openSSE(res);
   sendTools(res);
 
   req.on("data", async (buf) => {
-    // possono arrivare più frame newline-separated
     for (const line of buf.toString().trim().split(/\n/).filter(Boolean)) {
       try {
         const msg = JSON.parse(line);
@@ -96,7 +113,6 @@ app.post("/sse", (req, res) => {
         }
 
         else if (name === "qricambi.searchPriceAvailability") {
-          // guardrail limiti Qricambi: max 3 SKU e 1 fornitore per chiamata
           if (!args?.skus || !Array.isArray(args.skus) || args.skus.length === 0 || args.skus.length > 3) {
             sendSSE(res, msg.id, { jsonrpc: "2.0", error: { code: -32000, message: "1–3 SKU richiesti" } });
             continue;
@@ -132,7 +148,10 @@ app.post("/sse", (req, res) => {
 
         sendSSE(res, msg.id, { jsonrpc: "2.0", result: out });
       } catch (e) {
-        sendSSE(res, "err", { jsonrpc: "2.0", error: { code: -32000, message: String(e.message || e) } });
+        sendSSE(res, "err", {
+          jsonrpc: "2.0",
+          error: { code: -32000, message: String(e.message || e) }
+        });
       }
     }
   });
@@ -140,6 +159,6 @@ app.post("/sse", (req, res) => {
   req.on("close", () => res.end());
 });
 
-// --- start ---
+// --- avvio ---
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`MCP on :${PORT}`));
