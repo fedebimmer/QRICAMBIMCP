@@ -3,7 +3,7 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --- CORS globale + preflight ---
+// -------- CORS globale + preflight --------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -12,9 +12,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- helper ---
+// -------- helper --------
 const sendSSE = (res, id, payload) =>
   res.write(`event: message\nid: ${id}\ndata: ${JSON.stringify(payload)}\n\n`);
+
+const contentText = (obj) => [{ type: "text", text: JSON.stringify(obj) }];
 
 const bearer = () => {
   const t = process.env.QRICAMBI_BEARER;
@@ -33,20 +35,42 @@ const openSSE = (res) => {
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Authorization"
   });
-  // Heartbeat per evitare timeout (15s)
   const hb = setInterval(() => res.write(`: ping\n\n`), 15000);
   res.on("close", () => clearInterval(hb));
 };
 
+// -------- tools/list --------
 const sendTools = (res) => {
   sendSSE(res, "tools", {
     jsonrpc: "2.0",
     method: "tools/list",
     result: {
       tools: [
+        // Standard MCP
+        {
+          name: "search",
+          description:
+            "Ricerca Qricambi. Formati supportati: 'plate:AB123CD' oppure 'supplier:NAME skus:SKU1,SKU2,SKU3'.",
+          input_schema: {
+            type: "object",
+            required: ["query"],
+            properties: { query: { type: "string" } }
+          }
+        },
+        {
+          name: "fetch",
+          description:
+            "Recupera il dettaglio per un id restituito da search.",
+          input_schema: {
+            type: "object",
+            required: ["id"],
+            properties: { id: { type: "string" } }
+          }
+        },
+        // Tool specifici
         {
           name: "qricambi.mysupplier",
-          description: "Elenco fornitori salvati",
+          description: "Elenco fornitori salvati nel tuo account Qricambi",
           input_schema: { type: "object", properties: {} }
         },
         {
@@ -79,19 +103,19 @@ const sendTools = (res) => {
   });
 };
 
-// --- health check ---
+// -------- health --------
 app.get("/", (_req, res) => res.send("Qricambi MCP up"));
 
-// --- preflight explicito per /sse ---
+// Preflight esplicito
 app.options("/sse", (_req, res) => res.sendStatus(204));
 
-// --- handshake GET /sse ---
+// -------- GET /sse (handshake/stream) --------
 app.get("/sse", (req, res) => {
   openSSE(res);
   sendTools(res);
 });
 
-// --- POST /sse: flusso + invocazioni tools ---
+// -------- POST /sse (stream + invocazioni) --------
 app.post("/sse", (req, res) => {
   openSSE(res);
   sendTools(res);
@@ -103,54 +127,177 @@ app.post("/sse", (req, res) => {
         if (msg.method !== "tools/call") continue;
 
         const { name, arguments: args } = msg.params || {};
-        let out;
+
+        // ---------- ROUTER ----------
+        if (name === "search") {
+          // pattern plate:XYZ
+          const plateMatch = args?.query?.match(/plate:([A-Z0-9]+)/i);
+          const supplierMatch = args?.query?.match(/supplier:([^\s]+)/i);
+          const skusMatch = args?.query?.match(/skus:([A-Za-z0-9,\-_.]+)/i);
+
+          const results = [];
+
+          if (plateMatch) {
+            const plate = plateMatch[1].toUpperCase();
+            results.push({
+              id: `plate|${plate}`,
+              title: `Veicolo per targa ${plate}`,
+              url: `vehiclebyplate:${plate}`
+            });
+          }
+
+          if (supplierMatch && skusMatch) {
+            const supplier = supplierMatch[1];
+            const skus = skusMatch[1]
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .slice(0, 3);
+            for (const sku of skus) {
+              results.push({
+                id: `price|${supplier}|${sku}`,
+                title: `Prezzo/disp. ${sku} @ ${supplier}`,
+                url: `searchpriceandavailability:${supplier}:${sku}`
+              });
+            }
+          }
+
+          if (results.length === 0) {
+            sendSSE(res, msg.id, {
+              jsonrpc: "2.0",
+              content: contentText({
+                error:
+                  "Formato query non supportato. Usa 'plate:AB123CD' oppure 'supplier:NOME skus:SKU1,SKU2,SKU3'."
+              })
+            });
+            continue;
+          }
+
+          sendSSE(res, msg.id, {
+            jsonrpc: "2.0",
+            content: contentText({ results })
+          });
+          continue;
+        }
+
+        if (name === "fetch") {
+          const id = String(args?.id || "");
+          if (id.startsWith("plate|")) {
+            const plate = id.split("|")[1];
+            const u = new URL("https://api.qricambi.com/vehiclebyplate");
+            u.searchParams.set("plate", plate);
+            const r = await fetch(u, {
+              headers: { Authorization: bearer(), accept: "application/json" }
+            });
+            const data = await r.json();
+            sendSSE(res, msg.id, {
+              jsonrpc: "2.0",
+              content: contentText({
+                id,
+                title: `Veicolo ${plate}`,
+                text: JSON.stringify(data),
+                url: `vehiclebyplate:${plate}`
+              })
+            });
+            continue;
+          }
+          if (id.startsWith("price|")) {
+            const [, supplier, sku] = id.split("|");
+            const r = await fetch(
+              "https://api.qricambi.com/searchpriceandavailability",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: bearer()
+                },
+                body: JSON.stringify({
+                  supplier,
+                  skus: [sku],
+                  qty: 1
+                })
+              }
+            );
+            const data = await r.json();
+            sendSSE(res, msg.id, {
+              jsonrpc: "2.0",
+              content: contentText({
+                id,
+                title: `Prezzo/disp. ${sku} @ ${supplier}`,
+                text: JSON.stringify(data),
+                url: `searchpriceandavailability:${supplier}:${sku}`
+              })
+            });
+            continue;
+          }
+          sendSSE(res, msg.id, {
+            jsonrpc: "2.0",
+            content: contentText({ error: "id non riconosciuto" })
+          });
+          continue;
+        }
 
         if (name === "qricambi.mysupplier") {
           const r = await fetch("https://api.qricambi.com/mysupplier", {
             headers: { Authorization: bearer(), accept: "application/json" }
           });
-          out = await r.json();
-        }
-
-        else if (name === "qricambi.searchPriceAvailability") {
-          if (!args?.skus || !Array.isArray(args.skus) || args.skus.length === 0 || args.skus.length > 3) {
-            sendSSE(res, msg.id, { jsonrpc: "2.0", error: { code: -32000, message: "1–3 SKU richiesti" } });
-            continue;
-          }
-          const r = await fetch("https://api.qricambi.com/searchpriceandavailability", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: bearer() },
-            body: JSON.stringify({
-              supplier: args.supplier,
-              skus: args.skus,
-              qty: args.qty ?? 1,
-              brand_input: args.brand_input,
-              user: args.user,
-              password: args.password
-            })
-          });
-          out = await r.json();
-        }
-
-        else if (name === "qricambi.vehicleByPlate") {
-          const u = new URL("https://api.qricambi.com/vehiclebyplate");
-          u.searchParams.set("plate", args.plate);
-          const r = await fetch(u, {
-            headers: { Authorization: bearer(), accept: "application/json" }
-          });
-          out = await r.json();
-        }
-
-        else {
-          sendSSE(res, msg.id, { jsonrpc: "2.0", error: { code: -32601, message: "Tool sconosciuto" } });
+          const out = await r.json();
+          sendSSE(res, msg.id, { jsonrpc: "2.0", content: contentText(out) });
           continue;
         }
 
-        sendSSE(res, msg.id, { jsonrpc: "2.0", result: out });
+        if (name === "qricambi.searchPriceAvailability") {
+          const a = args || {};
+          if (!a?.skus || !Array.isArray(a.skus) || a.skus.length === 0 || a.skus.length > 3) {
+            sendSSE(res, msg.id, {
+              jsonrpc: "2.0",
+              content: contentText({ error: "1–3 SKU richiesti" })
+            });
+            continue;
+          }
+          const r = await fetch(
+            "https://api.qricambi.com/searchpriceandavailability",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: bearer()
+              },
+              body: JSON.stringify({
+                supplier: a.supplier,
+                skus: a.skus,
+                qty: a.qty ?? 1,
+                brand_input: a.brand_input,
+                user: a.user,
+                password: a.password
+              })
+            }
+          );
+          const out = await r.json();
+          sendSSE(res, msg.id, { jsonrpc: "2.0", content: contentText(out) });
+          continue;
+        }
+
+        if (name === "qricambi.vehicleByPlate") {
+          const u = new URL("https://api.qricambi.com/vehiclebyplate");
+          u.searchParams.set("plate", args?.plate);
+          const r = await fetch(u, {
+            headers: { Authorization: bearer(), accept: "application/json" }
+          });
+          const out = await r.json();
+          sendSSE(res, msg.id, { jsonrpc: "2.0", content: contentText(out) });
+          continue;
+        }
+
+        // sconosciuto
+        sendSSE(res, msg.id, {
+          jsonrpc: "2.0",
+          content: contentText({ error: "Tool sconosciuto" })
+        });
       } catch (e) {
         sendSSE(res, "err", {
           jsonrpc: "2.0",
-          error: { code: -32000, message: String(e.message || e) }
+          content: contentText({ error: String(e.message || e) })
         });
       }
     }
@@ -159,6 +306,6 @@ app.post("/sse", (req, res) => {
   req.on("close", () => res.end());
 });
 
-// --- avvio ---
+// -------- avvio --------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`MCP on :${PORT}`));
