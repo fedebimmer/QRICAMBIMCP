@@ -27,7 +27,7 @@ const bearer = () => {
 const openSSE = (res) => {
   res.status(200);
   res.set({
-    "Content-Type": "text/event-stream",
+    "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
@@ -35,7 +35,12 @@ const openSSE = (res) => {
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Authorization"
   });
-  const hb = setInterval(() => res.write(`: ping\n\n`), 15000);
+  // padding iniziale per sbloccare proxy che bufferizzano
+  res.write(":" + " ".repeat(2048) + "\n\n");
+  // tempo di reconnection suggerito
+  res.write("retry: 5000\n\n");
+  // heartbeat più frequente
+  const hb = setInterval(() => res.write(`: ping\n\n`), 10000);
   res.on("close", () => clearInterval(hb));
 };
 
@@ -50,7 +55,7 @@ const sendTools = (res) => {
         {
           name: "search",
           description:
-            "Ricerca Qricambi. Formati supportati: 'plate:AB123CD' oppure 'supplier:NAME skus:SKU1,SKU2,SKU3'.",
+            "Ricerca Qricambi. Formati: 'plate:AB123CD' oppure 'supplier:NOME skus:SKU1,SKU2,SKU3'.",
           input_schema: {
             type: "object",
             required: ["query"],
@@ -59,8 +64,7 @@ const sendTools = (res) => {
         },
         {
           name: "fetch",
-          description:
-            "Recupera il dettaglio per un id restituito da search.",
+          description: "Dettaglio per un id restituito da search.",
           input_schema: {
             type: "object",
             required: ["id"],
@@ -112,7 +116,9 @@ app.options("/sse", (_req, res) => res.sendStatus(204));
 // -------- GET /sse (handshake/stream) --------
 app.get("/sse", (req, res) => {
   openSSE(res);
+  // invia subito tools e poi reinvia dopo 1s per aggirare client lenti
   sendTools(res);
+  setTimeout(() => sendTools(res), 1000);
 });
 
 // -------- POST /sse (stream + invocazioni) --------
@@ -130,7 +136,6 @@ app.post("/sse", (req, res) => {
 
         // ---------- ROUTER ----------
         if (name === "search") {
-          // pattern plate:XYZ
           const plateMatch = args?.query?.match(/plate:([A-Z0-9]+)/i);
           const supplierMatch = args?.query?.match(/supplier:([^\s]+)/i);
           const skusMatch = args?.query?.match(/skus:([A-Za-z0-9,\-_.]+)/i);
@@ -167,7 +172,7 @@ app.post("/sse", (req, res) => {
               jsonrpc: "2.0",
               content: contentText({
                 error:
-                  "Formato query non supportato. Usa 'plate:AB123CD' oppure 'supplier:NOME skus:SKU1,SKU2,SKU3'."
+                  "Formato query non supportato. Usa 'plate:AB123CD' o 'supplier:NOME skus:SKU1,SKU2,SKU3'."
               })
             });
             continue;
@@ -211,11 +216,7 @@ app.post("/sse", (req, res) => {
                   "Content-Type": "application/json",
                   Authorization: bearer()
                 },
-                body: JSON.stringify({
-                  supplier,
-                  skus: [sku],
-                  qty: 1
-                })
+                body: JSON.stringify({ supplier, skus: [sku], qty: 1 })
               }
             );
             const data = await r.json();
@@ -289,7 +290,6 @@ app.post("/sse", (req, res) => {
           continue;
         }
 
-        // sconosciuto
         sendSSE(res, msg.id, {
           jsonrpc: "2.0",
           content: contentText({ error: "Tool sconosciuto" })
